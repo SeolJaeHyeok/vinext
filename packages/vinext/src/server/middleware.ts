@@ -92,10 +92,10 @@ export function matchesMiddleware(
   matcher: MatcherConfig | undefined,
 ): boolean {
   if (!matcher) {
-    // Default: match all paths except static files, _next, and favicon
+    // Default: match all paths except /_next internals, static files (paths with a file extension), and /favicon.ico — matching Next.js behaviour.
+    // Note: /api routes ARE included by default, consistent with Next.js.
     return (
       !pathname.startsWith("/_next") &&
-      !pathname.startsWith("/api") &&
       !pathname.includes(".") &&
       pathname !== "/favicon.ico"
     );

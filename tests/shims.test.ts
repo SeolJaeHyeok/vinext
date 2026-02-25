@@ -1481,14 +1481,15 @@ describe("middleware matcher patterns", () => {
     const { matchesMiddleware } = await import(
       "../packages/vinext/src/server/middleware.js"
     );
-    // Default: matches most paths
+    // Default: matches most paths, including /api routes (Next.js behaviour)
     expect(matchesMiddleware("/", undefined)).toBe(true);
     expect(matchesMiddleware("/about", undefined)).toBe(true);
     expect(matchesMiddleware("/dashboard/settings", undefined)).toBe(true);
+    expect(matchesMiddleware("/api/hello", undefined)).toBe(true);
+    expect(matchesMiddleware("/api/users/123", undefined)).toBe(true);
 
-    // Default: excludes /_next, /api, files with dots, /favicon.ico
+    // Default: excludes /_next internals, static files (extension), /favicon.ico
     expect(matchesMiddleware("/_next/static/chunk.js", undefined)).toBe(false);
-    expect(matchesMiddleware("/api/hello", undefined)).toBe(false);
     expect(matchesMiddleware("/favicon.ico", undefined)).toBe(false);
     expect(matchesMiddleware("/image.png", undefined)).toBe(false);
   });
