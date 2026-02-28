@@ -386,6 +386,27 @@ These are intentional exclusions:
 - **Node.js production server (`vinext start`)** works for testing but is less complete than Workers deployment. Cloudflare Workers is the primary target.
 - **Native Node modules (sharp, resvg, satori, lightningcss, @napi-rs/canvas)** crash Vite's RSC dev environment. Dynamic OG image/icon routes using these work in production builds but not in dev mode. These are auto-stubbed during `vinext deploy`.
 
+## Ecosystem library compatibility
+
+Popular Next.js libraries tested with vinext. Run `vinext check` in your project to scan for known compatibility issues.
+
+| Library | Status | Notes |
+|---------|--------|-------|
+| next-themes | ✅ | Works out of the box |
+| nuqs | ✅ | URL search param state management. Requires `ssr.noExternal: ["nuqs"]` in Vite config |
+| next-view-transitions | ✅ | Works out of the box |
+| better-auth | ✅ | Uses only public `next/*` APIs (headers, cookies, NextRequest/NextResponse) |
+| @vercel/analytics | ✅ | Analytics script injected client-side |
+| tailwindcss | ✅ | Works out of the box |
+| framer-motion | ✅ | Works out of the box |
+| shadcn-ui | ✅ | Works out of the box |
+| next-intl | 🟡 | Webpack alias extraction works (PR #196), but `createNextIntlPlugin` fails without `next` installed. Manual alias workaround available. See [#202](https://github.com/cloudflare/vinext/issues/202) |
+| @sentry/nextjs | 🟡 | Client-side works, server integration needs manual setup |
+| @clerk/nextjs | ❌ | Deep Next.js middleware integration not compatible |
+| next-auth / @auth/nextjs | ❌ | Relies on Next.js API route internals. Consider [better-auth](https://www.better-auth.com/) |
+
+Libraries that only import from `next/*` public APIs generally work. Libraries that depend on Next.js build plugins or internal webpack configuration need custom shimming or manual workarounds.
+
 ## Benchmarks
 
 > **Caveat:** Benchmarks are hard to get right and these are early results. Take them as directional, not definitive.
