@@ -2186,6 +2186,39 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain("*.preview.dev");
     expect(code).toContain("__allowedDevOrigins");
   });
+
+  describe("rscOnError: non-plain object dev hint", () => {
+    it("includes detection for the 'Only plain objects' RSC serialization error", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain(
+        "Only plain objects, and a few built-ins, can be passed to Client Components",
+      );
+    });
+
+    it("guards the dev hint behind a NODE_ENV !== production check", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      // The hint must be suppressed in production builds
+      expect(code).toContain('process.env.NODE_ENV !== "production"');
+    });
+
+    it("includes actionable guidance about module namespace objects in the hint", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain("import * as X");
+      expect(code).toContain("[vinext] RSC serialization error");
+    });
+
+    it("includes actionable guidance about class instances in the hint", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      expect(code).toContain("class instance");
+    });
+
+    it("does not affect the digest return path for navigation errors", () => {
+      const code = generateRscEntry("/tmp/test/app", minimalRoutes, null, [], null, "", false);
+      // The existing digest path (redirect/notFound) must still be present
+      expect(code).toContain('"digest" in error');
+      expect(code).toContain("String(error.digest)");
+    });
+  });
 });
 
 describe("App Router middleware with NextRequest", () => {
