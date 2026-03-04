@@ -321,21 +321,22 @@ function rscOnError(error) {
     error.message.includes("Only plain objects, and a few built-ins, can be passed to Client Components")
   ) {
     console.error(
-      "[vinext] RSC serialization error: a non-plain object was passed from a Server Component to a Client Component.\n" +
-      "\n" +
-      "Common causes:\n" +
-      "  * Passing a module namespace (import * as X) directly as a prop.\n" +
-      "    Unlike Next.js (webpack), Vite produces real ESM module namespace objects\n" +
-      "    which are not serializable. Fix: pass individual values instead,\n" +
-      "    e.g. <Comp value={module.value} />\n" +
-      "  * Passing a class instance (new Foo()) as a prop.\n" +
-      "    Fix: convert to a plain object, e.g. { id: foo.id, name: foo.name }\n" +
-      "  * Passing a Date, Map, or Set. Use .toISOString(), [...map.entries()], etc.\n" +
-      "  * Passing Object.create(null). Use { ...obj } to restore a prototype.\n" +
-      "\n" +
+      "[vinext] RSC serialization error: a non-plain object was passed from a Server Component to a Client Component.\\n" +
+      "\\n" +
+      "Common causes:\\n" +
+      "  * Passing a module namespace (import * as X) directly as a prop.\\n" +
+      "    Unlike Next.js (webpack), Vite produces real ESM module namespace objects\\n" +
+      "    which are not serializable. Fix: pass individual values instead,\\n" +
+      "    e.g. <Comp value={module.value} />\\n" +
+      "  * Passing a class instance (new Foo()) as a prop.\\n" +
+      "    Fix: convert to a plain object, e.g. { id: foo.id, name: foo.name }\\n" +
+      "  * Passing a Date, Map, or Set. Use .toISOString(), [...map.entries()], etc.\\n" +
+      "  * Passing Object.create(null). Use { ...obj } to restore a prototype.\\n" +
+      "\\n" +
       "Original error:",
       error.message,
     );
+    return undefined;
   }
 
   // In production, generate a digest hash for non-navigation errors
