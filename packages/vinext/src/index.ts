@@ -24,6 +24,7 @@ import { logRequest, now } from "./server/request-log.js";
 import { generateSafeRegExpCode, generateMiddlewareMatcherCode, generateNormalizePathCode } from "./server/middleware-codegen.js";
 import { normalizePath } from "./server/normalize-path.js";
 import { findInstrumentationFile, runInstrumentation } from "./server/instrumentation.js";
+import { PHASE_PRODUCTION_BUILD, PHASE_DEVELOPMENT_SERVER } from "./shims/constants.js";
 import { validateDevRequest } from "./server/dev-origin-check.js";
 import {
   safeRegExp,
@@ -1786,7 +1787,8 @@ hydrate();
         instrumentationPath = findInstrumentationFile(root);
 
         // Load next.config.js if present (always from project root, not src/)
-        const rawConfig = await loadNextConfig(root);
+        const phase = env?.command === "build" ? PHASE_PRODUCTION_BUILD : PHASE_DEVELOPMENT_SERVER;
+        const rawConfig = await loadNextConfig(root, phase);
         nextConfig = await resolveNextConfig(rawConfig);
         fileMatcher = createValidFileMatcher(nextConfig.pageExtensions);
 
