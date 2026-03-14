@@ -12,6 +12,7 @@ import { fileURLToPath } from "node:url";
 import { pagesRouter, apiRouter, type Route } from "../routing/pages-router.js";
 import { createValidFileMatcher } from "../routing/file-matcher.js";
 import { type ResolvedNextConfig } from "../config/next-config.js";
+import { buildPrecompiledConfigCode } from "../config/precompiled-config.js";
 import { isProxyFile } from "../server/middleware.js";
 import {
   generateSafeRegExpCode,
@@ -113,6 +114,11 @@ export async function generateServerEntry(
       contentDispositionType: nextConfig?.images?.contentDispositionType,
       contentSecurityPolicy: nextConfig?.images?.contentSecurityPolicy,
     },
+  });
+  const precompiledConfigCode = buildPrecompiledConfigCode({
+    redirects: nextConfig?.redirects ?? [],
+    rewrites: nextConfig?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] },
+    headers: nextConfig?.headers ?? [],
   });
 
   // Generate instrumentation code if instrumentation.ts exists.
@@ -293,6 +299,11 @@ const buildId = ${buildIdJson};
 
 // Full resolved config for production server (embedded at build time)
 export const vinextConfig = ${vinextConfigJson};
+export const vinextCompiledConfig = {
+  redirects: ${precompiledConfigCode.redirects},
+  rewrites: ${precompiledConfigCode.rewrites},
+  headers: ${precompiledConfigCode.headers},
+};
 
 class ApiBodyParseError extends Error {
   constructor(message, statusCode) {

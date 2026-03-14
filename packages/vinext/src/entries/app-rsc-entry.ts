@@ -15,6 +15,7 @@ import type {
   NextRedirect,
   NextRewrite,
 } from "../config/next-config.js";
+import { buildPrecompiledConfigCode } from "../config/precompiled-config.js";
 import type { AppRoute } from "../routing/app-router.js";
 import { generateDevOriginCheckCode } from "../server/dev-origin-check.js";
 import type { MetadataFileRoute } from "../server/metadata-routes.js";
@@ -112,6 +113,7 @@ export function generateRscEntry(
   const redirects = config?.redirects ?? [];
   const rewrites = config?.rewrites ?? { beforeFiles: [], afterFiles: [], fallback: [] };
   const headers = config?.headers ?? [];
+  const compiledConfig = buildPrecompiledConfigCode({ redirects, rewrites, headers });
   const allowedOrigins = config?.allowedOrigins ?? [];
   const bodySizeLimit = config?.bodySizeLimit ?? 1 * 1024 * 1024;
   const i18nConfig = config?.i18n ?? null;
@@ -1332,6 +1334,9 @@ const __i18nConfig = ${JSON.stringify(i18nConfig)};
 const __configRedirects = ${JSON.stringify(redirects)};
 const __configRewrites = ${JSON.stringify(rewrites)};
 const __configHeaders = ${JSON.stringify(headers)};
+const __compiledRedirects = ${compiledConfig.redirects};
+const __compiledRewrites = ${compiledConfig.rewrites};
+const __compiledHeaders = ${compiledConfig.headers};
 const __allowedOrigins = ${JSON.stringify(allowedOrigins)};
 
 ${generateDevOriginCheckCode(config?.allowedDevOrigins)}
@@ -1472,7 +1477,7 @@ export default async function handler(request, ctx) {
         let pathname;
         try { pathname = __normalizePath(__normalizePathnameForRouteMatch(url.pathname)); } catch { pathname = url.pathname; }
         ${bp ? `if (pathname.startsWith(${JSON.stringify(bp)})) pathname = pathname.slice(${JSON.stringify(bp)}.length) || "/";` : ""}
-        const extraHeaders = matchHeaders(pathname, __configHeaders, __reqCtx);
+        const extraHeaders = matchHeaders(pathname, __configHeaders, __reqCtx, __compiledHeaders);
         for (const h of extraHeaders) {
           // Use append() for headers where multiple values must coexist
           // (Vary, Set-Cookie). Using set() on these would destroy
@@ -1542,7 +1547,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
     // arrive as /some/path.rsc but redirect patterns are defined without it (e.g.
     // /some/path). Without this, soft-nav fetches bypass all config redirects.
     const __redirPathname = pathname.endsWith(".rsc") ? pathname.slice(0, -4) : pathname;
-    const __redir = matchRedirect(__redirPathname, __configRedirects, __reqCtx);
+    const __redir = matchRedirect(__redirPathname, __configRedirects, __reqCtx, __compiledRedirects);
     if (__redir) {
       const __redirDest = sanitizeDestination(
         __basePath &&
@@ -1669,7 +1674,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   // In App Router execution order, beforeFiles runs after middleware so that
   // has/missing conditions can evaluate against middleware-modified headers.
   if (__configRewrites.beforeFiles && __configRewrites.beforeFiles.length) {
-    const __rewritten = matchRewrite(cleanPathname, __configRewrites.beforeFiles, __postMwReqCtx);
+    const __rewritten = matchRewrite(cleanPathname, __configRewrites.beforeFiles, __postMwReqCtx, __compiledRewrites.beforeFiles);
     if (__rewritten) {
       if (isExternalUrl(__rewritten)) {
         setHeadersContext(null);
@@ -1939,7 +1944,12 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
 
   // ── Apply afterFiles rewrites from next.config.js ──────────────────────
   if (__configRewrites.afterFiles && __configRewrites.afterFiles.length) {
-    const __afterRewritten = matchRewrite(cleanPathname, __configRewrites.afterFiles, __postMwReqCtx);
+    const __afterRewritten = matchRewrite(
+      cleanPathname,
+      __configRewrites.afterFiles,
+      __postMwReqCtx,
+      __compiledRewrites.afterFiles,
+    );
     if (__afterRewritten) {
       if (isExternalUrl(__afterRewritten)) {
         setHeadersContext(null);
@@ -1954,7 +1964,12 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
 
   // ── Fallback rewrites from next.config.js (if no route matched) ───────
   if (!match && __configRewrites.fallback && __configRewrites.fallback.length) {
-    const __fallbackRewritten = matchRewrite(cleanPathname, __configRewrites.fallback, __postMwReqCtx);
+    const __fallbackRewritten = matchRewrite(
+      cleanPathname,
+      __configRewrites.fallback,
+      __postMwReqCtx,
+      __compiledRewrites.fallback,
+    );
     if (__fallbackRewritten) {
       if (isExternalUrl(__fallbackRewritten)) {
         setHeadersContext(null);
