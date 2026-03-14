@@ -41,7 +41,12 @@ import {
   requestContextFromRequest,
   sanitizeDestination,
   type RequestContext,
+  type CompiledConfigPattern,
 } from "./config/config-matchers.js";
+import {
+  buildPrecompiledConfigPatterns,
+  type PrecompiledConfigPatterns,
+} from "./config/precompiled-config.js";
 import { scanMetadataFiles } from "./server/metadata-routes.js";
 import { staticExportPages } from "./build/static-export.js";
 import { buildRequestHeadersFromMiddlewareResponse } from "./server/middleware-request-headers.js";
@@ -727,6 +732,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
   // Shim alias map — populated in config(), used by resolveId() for .js variants
   let nextShimMap: Record<string, string> = {};
+  let precompiledNextConfig: PrecompiledConfigPatterns = {
+    redirects: [],
+    rewrites: { beforeFiles: [], afterFiles: [], fallback: [] },
+    headers: [],
+  };
 
   // Build-only cache for og-inline-fetch-assets to avoid repeated file reads
   // during a single production build. Dev mode skips the cache so asset edits
@@ -937,6 +947,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         const phase = env?.command === "build" ? PHASE_PRODUCTION_BUILD : PHASE_DEVELOPMENT_SERVER;
         const rawConfig = await loadNextConfig(root, phase);
         nextConfig = await resolveNextConfig(rawConfig, root);
+        precompiledNextConfig = buildPrecompiledConfigPatterns(nextConfig);
         fileMatcher = createValidFileMatcher(nextConfig.pageExtensions);
 
         // Merge env from next.config.js with NEXT_PUBLIC_* env vars
@@ -2184,6 +2195,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   nextConfig.redirects,
                   preMiddlewareReqCtx,
                   nextConfig.basePath ?? "",
+                  precompiledNextConfig.redirects,
                 );
                 if (redirected) return;
               }
@@ -2318,14 +2330,25 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               // pre-middleware request state; middleware response headers win
               // later because they are already on the outgoing response.
               if (nextConfig?.headers.length) {
-                applyHeaders(pathname, res, nextConfig.headers, preMiddlewareReqCtx);
+                applyHeaders(
+                  pathname,
+                  res,
+                  nextConfig.headers,
+                  preMiddlewareReqCtx,
+                  precompiledNextConfig.headers,
+                );
               }
 
               // Apply rewrites from next.config.js (beforeFiles)
               let resolvedUrl = url;
               if (nextConfig?.rewrites.beforeFiles.length) {
                 resolvedUrl =
-                  applyRewrites(pathname, nextConfig.rewrites.beforeFiles, reqCtx) ?? url;
+                  applyRewrites(
+                    pathname,
+                    nextConfig.rewrites.beforeFiles,
+                    reqCtx,
+                    precompiledNextConfig.rewrites.beforeFiles,
+                  ) ?? url;
               }
 
               // External rewrite from beforeFiles — proxy to external URL
@@ -2369,6 +2392,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   resolvedUrl.split("?")[0],
                   nextConfig.rewrites.afterFiles,
                   reqCtx,
+                  precompiledNextConfig.rewrites.afterFiles,
                 );
                 if (afterRewrite) resolvedUrl = afterRewrite;
               }
@@ -2406,6 +2430,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   resolvedUrl.split("?")[0],
                   nextConfig.rewrites.fallback,
                   reqCtx,
+                  precompiledNextConfig.rewrites.fallback,
                 );
                 if (fallbackRewrite) {
                   // External fallback rewrite — proxy to external URL
@@ -3544,8 +3569,9 @@ function applyRedirects(
   redirects: NextRedirect[],
   ctx: RequestContext,
   basePath = "",
+  compiledPatterns?: Array<CompiledConfigPattern | null>,
 ): boolean {
-  const result = matchRedirect(pathname, redirects, ctx);
+  const result = matchRedirect(pathname, redirects, ctx, compiledPatterns);
   if (result) {
     // Sanitize to prevent open redirect via protocol-relative URLs
     const dest = sanitizeDestination(
@@ -3631,8 +3657,9 @@ function applyRewrites(
   pathname: string,
   rewrites: NextRewrite[],
   ctx: RequestContext,
+  compiledPatterns?: Array<CompiledConfigPattern | null>,
 ): string | null {
-  const dest = matchRewrite(pathname, rewrites, ctx);
+  const dest = matchRewrite(pathname, rewrites, ctx, compiledPatterns);
   if (dest) {
     // Sanitize to prevent open redirect via protocol-relative URLs
     return sanitizeDestination(dest);
@@ -3650,8 +3677,9 @@ function applyHeaders(
   res: any,
   headers: NextHeader[],
   ctx: RequestContext,
+  compiledSources?: Array<RegExp | null>,
 ): void {
-  const matched = matchHeaders(pathname, headers, ctx);
+  const matched = matchHeaders(pathname, headers, ctx, compiledSources);
   for (const header of matched) {
     // Use append semantics for headers where multiple values must coexist
     // (Vary, Set-Cookie). Using setHeader() on these would destroy

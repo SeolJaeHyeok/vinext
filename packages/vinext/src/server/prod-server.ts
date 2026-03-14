@@ -728,7 +728,8 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
   // Import the server entry module (use file:// URL for reliable dynamic import)
   const serverEntry = await import(pathToFileURL(serverEntryPath).href);
-  const { renderPage, handleApiRoute: handleApi, runMiddleware, vinextConfig } = serverEntry;
+  const { renderPage, handleApiRoute: handleApi, runMiddleware, vinextConfig, vinextCompiledConfig } =
+    serverEntry;
 
   // Extract config values (embedded at build time in the server entry)
   const basePath: string = vinextConfig?.basePath ?? "";
@@ -741,6 +742,9 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     fallback: [],
   };
   const configHeaders = vinextConfig?.headers ?? [];
+  const compiledRedirects = vinextCompiledConfig?.redirects;
+  const compiledRewrites = vinextCompiledConfig?.rewrites;
+  const compiledHeaders = vinextCompiledConfig?.headers;
   // Compute allowed image widths from config (union of deviceSizes + imageSizes)
   const allowedImageWidths: number[] = [
     ...(vinextConfig?.images?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
@@ -910,7 +914,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
       // ── 4. Apply redirects from next.config.js ────────────────────
       if (configRedirects.length) {
-        const redirect = matchRedirect(pathname, configRedirects, reqCtx);
+        const redirect = matchRedirect(pathname, configRedirects, reqCtx, compiledRedirects);
         if (redirect) {
           // Guard against double-prefixing: only add basePath if destination
           // doesn't already start with it.
@@ -1028,7 +1032,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       // Middleware headers take precedence: skip config keys already set
       // by middleware so middleware always wins for the same key.
       if (configHeaders.length) {
-        const matched = matchHeaders(pathname, configHeaders, reqCtx);
+        const matched = matchHeaders(pathname, configHeaders, reqCtx, compiledHeaders);
         for (const h of matched) {
           const lk = h.key.toLowerCase();
           if (lk === "set-cookie") {
@@ -1052,7 +1056,12 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
       // ── 7. Apply beforeFiles rewrites from next.config.js ─────────
       if (configRewrites.beforeFiles?.length) {
-        const rewritten = matchRewrite(resolvedPathname, configRewrites.beforeFiles, postMwReqCtx);
+        const rewritten = matchRewrite(
+          resolvedPathname,
+          configRewrites.beforeFiles,
+          postMwReqCtx,
+          compiledRewrites?.beforeFiles,
+        );
         if (rewritten) {
           if (isExternalUrl(rewritten)) {
             const proxyResponse = await proxyExternalRequest(webRequest, rewritten);
@@ -1099,7 +1108,12 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
 
       // ── 9. Apply afterFiles rewrites from next.config.js ──────────
       if (configRewrites.afterFiles?.length) {
-        const rewritten = matchRewrite(resolvedPathname, configRewrites.afterFiles, postMwReqCtx);
+        const rewritten = matchRewrite(
+          resolvedPathname,
+          configRewrites.afterFiles,
+          postMwReqCtx,
+          compiledRewrites?.afterFiles,
+        );
         if (rewritten) {
           if (isExternalUrl(rewritten)) {
             const proxyResponse = await proxyExternalRequest(webRequest, rewritten);
@@ -1122,6 +1136,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
             resolvedPathname,
             configRewrites.fallback,
             postMwReqCtx,
+            compiledRewrites?.fallback,
           );
           if (fallbackRewrite) {
             if (isExternalUrl(fallbackRewrite)) {
