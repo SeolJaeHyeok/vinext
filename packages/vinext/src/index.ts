@@ -2718,6 +2718,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               };
 
               let middlewareRequestHeaders: Headers | null = null;
+              let deferredMwResponseHeaders: [string, string][] | null = null;
+
+              const applyDeferredMwHeaders = () => {
+                if (deferredMwResponseHeaders) {
+                  for (const [key, value] of deferredMwResponseHeaders) {
+                    res.appendHeader(key, value);
+                  }
+                }
+              };
 
               // Run middleware.ts if present
               if (middlewarePath) {
@@ -2798,9 +2807,21 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                     applyRequestHeadersToNodeRequest(middlewareRequestHeaders);
                   }
 
-                  for (const [key, value] of result.responseHeaders) {
-                    if (!key.startsWith("x-middleware-")) {
-                      res.appendHeader(key, value);
+                  if (hasAppDir) {
+                    // Hybrid app+pages: defer response headers. They'll be
+                    // applied to res for Pages routes or forwarded to the RSC
+                    // entry (via x-vinext-mw-ctx) for App Router routes.
+                    deferredMwResponseHeaders = [];
+                    for (const [key, value] of result.responseHeaders) {
+                      if (!key.startsWith("x-middleware-")) {
+                        deferredMwResponseHeaders.push([key, value]);
+                      }
+                    }
+                  } else {
+                    for (const [key, value] of result.responseHeaders) {
+                      if (!key.startsWith("x-middleware-")) {
+                        res.appendHeader(key, value);
+                      }
                     }
                   }
                 }
@@ -2820,6 +2841,27 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 }
                 if (result.rewriteStatus) {
                   req.__vinextRewriteStatus = result.rewriteStatus;
+                }
+
+                // Forward middleware context to the RSC entry so it can
+                // populate _mwCtx without re-running the middleware function.
+                // This prevents double execution in hybrid app+pages dev mode.
+                if (hasAppDir) {
+                  const mwCtxEntries: [string, string][] = [];
+                  if (result.responseHeaders) {
+                    for (const [key, value] of result.responseHeaders) {
+                      // Exclude control headers that runMiddleware already
+                      // consumed — matches the RSC entry's inline filtering.
+                      if (key !== "x-middleware-next" && key !== "x-middleware-rewrite") {
+                        mwCtxEntries.push([key, value]);
+                      }
+                    }
+                  }
+                  req.headers["x-vinext-mw-ctx"] = JSON.stringify({
+                    h: mwCtxEntries,
+                    s: result.rewriteStatus ?? null,
+                    r: result.rewriteUrl ?? null,
+                  });
                 }
               }
 
@@ -2850,6 +2892,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
               // External rewrite from beforeFiles — proxy to external URL
               if (isExternalUrl(resolvedUrl)) {
+                applyDeferredMwHeaders();
                 await proxyExternalRewriteNode(req, res, resolvedUrl);
                 return;
               }
@@ -2863,8 +2906,11 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   fileMatcher,
                 );
                 const apiMatch = matchRoute(resolvedUrl, apiRoutes);
-                if (apiMatch && middlewareRequestHeaders) {
-                  applyRequestHeadersToNodeRequest(middlewareRequestHeaders);
+                if (apiMatch) {
+                  applyDeferredMwHeaders();
+                  if (middlewareRequestHeaders) {
+                    applyRequestHeadersToNodeRequest(middlewareRequestHeaders);
+                  }
                 }
                 const handled = await handleApiRoute(server, req, res, resolvedUrl, apiRoutes);
                 if (handled) return;
@@ -2895,6 +2941,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
 
               // External rewrite from afterFiles — proxy to external URL
               if (isExternalUrl(resolvedUrl)) {
+                applyDeferredMwHeaders();
                 await proxyExternalRewriteNode(req, res, resolvedUrl);
                 return;
               }
@@ -2913,6 +2960,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
               // Try rendering the resolved URL
               const match = matchRoute(resolvedUrl.split("?")[0], routes);
               if (match) {
+                applyDeferredMwHeaders();
                 if (middlewareRequestHeaders) {
                   applyRequestHeadersToNodeRequest(middlewareRequestHeaders);
                 }
@@ -2930,6 +2978,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 if (fallbackRewrite) {
                   // External fallback rewrite — proxy to external URL
                   if (isExternalUrl(fallbackRewrite)) {
+                    applyDeferredMwHeaders();
                     await proxyExternalRewriteNode(req, res, fallbackRewrite);
                     return;
                   }
@@ -2937,6 +2986,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                   if (!fallbackMatch && hasAppDir) {
                     return next();
                   }
+                  applyDeferredMwHeaders();
                   if (middlewareRequestHeaders) {
                     applyRequestHeadersToNodeRequest(middlewareRequestHeaders);
                   }
