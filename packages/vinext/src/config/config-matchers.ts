@@ -775,26 +775,6 @@ export function matchRedirect(
 ): { destination: string; permanent: boolean } | null {
   if (redirects.length === 0) return null;
 
-  if (compiledPatterns) {
-    for (let i = 0; i < redirects.length; i++) {
-      const redirect = redirects[i];
-      const compiled = compiledPatterns[i];
-      const params = compiled
-        ? execCompiledConfigPattern(pathname, compiled)
-        : matchConfigPattern(pathname, redirect.source);
-      if (!params) continue;
-      if (redirect.has || redirect.missing) {
-        if (!checkHasConditions(redirect.has, redirect.missing, ctx)) {
-          continue;
-        }
-      }
-      let dest = substituteDestinationParams(redirect.destination, params);
-      dest = sanitizeDestination(dest);
-      return { destination: dest, permanent: redirect.permanent };
-    }
-    return null;
-  }
-
   const index = _getRedirectIndex(redirects);
 
   // --- Locate the best locale-static candidate ---
@@ -873,7 +853,10 @@ export function matchRedirect(
       // the locale-static match wins. Stop scanning.
       break;
     }
-    const params = matchConfigPattern(pathname, redirect.source);
+    const compiled = compiledPatterns?.[origIdx];
+    const params = compiled
+      ? execCompiledConfigPattern(pathname, compiled)
+      : matchConfigPattern(pathname, redirect.source);
     if (params) {
       if (redirect.has || redirect.missing) {
         if (!checkHasConditions(redirect.has, redirect.missing, ctx)) {
@@ -1104,8 +1087,11 @@ export function matchHeaders(
   const result: Array<{ key: string; value: string }> = [];
   for (let i = 0; i < headers.length; i++) {
     const rule = headers[i];
-    // Cache the compiled source regex — escapeHeaderSource() + safeRegExp() are
-    // pure functions of rule.source and the result never changes between requests.
+    // Two-tier source lookup: the precompiled array (from buildPrecompiledConfigPatterns,
+    // passed by callers that hold a PrecompiledConfigPatterns object) is checked first.
+    // The module-level cache (_compiledHeaderSourceCache) is the fallback for callers
+    // that don't supply a precompiled array. escapeHeaderSource() + safeRegExp() are
+    // pure functions of rule.source so the compiled RegExp never changes between requests.
     let sourceRegex = compiledSources?.[i];
     if (sourceRegex === undefined) {
       sourceRegex = _compiledHeaderSourceCache.get(rule.source);
