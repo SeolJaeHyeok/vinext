@@ -610,6 +610,14 @@ function execCompiledConfigPattern(
   return params;
 }
 
+/**
+ * Pre-compile a Next.js config pattern into a RegExp + param-name list.
+ *
+ * Returns `null` for simple segment-based patterns (no groups, backslashes,
+ * catch-all suffixes, or dot-after-param) — these are already fast via the
+ * runtime segment matcher and don't benefit from regex compilation. Also
+ * returns `null` if the compiled regex is rejected by `safeRegExp`.
+ */
 export function compileConfigPattern(pattern: string): CompiledConfigPattern | null {
   if (!usesRegexBranch(pattern)) return null;
 
