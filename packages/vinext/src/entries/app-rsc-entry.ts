@@ -88,6 +88,15 @@ export interface AppRouterConfig {
   bodySizeLimit?: number;
   /** Internationalization routing config for middleware matcher locale handling. */
   i18n?: NextI18nConfig | null;
+  /**
+   * When true, the project has a `pages/` directory alongside the App Router.
+   * The generated RSC entry exposes `/__vinext/prerender/pages-static-paths`
+   * so `prerenderPages` can call `getStaticPaths` via `wrangler unstable_startWorker`
+   * in CF Workers builds. `pageRoutes` is loaded from the SSR environment via
+   * `import("./ssr/index.js")`, which re-exports it from
+   * `virtual:vinext-server-entry` when this flag is set.
+   */
+  hasPagesDir?: boolean;
 }
 
 /**
@@ -117,6 +126,7 @@ export function generateRscEntry(
   const allowedOrigins = config?.allowedOrigins ?? [];
   const bodySizeLimit = config?.bodySizeLimit ?? 1 * 1024 * 1024;
   const i18nConfig = config?.i18n ?? null;
+  const hasPagesDir = config?.hasPagesDir ?? false;
   // Build import map for all page and layout files
   const imports: string[] = [];
   const importMap: Map<string, string> = new Map();
@@ -296,12 +306,42 @@ ${slotEntries.join(",\n")}
 
   return `
 import {
-  renderToReadableStream,
+  renderToReadableStream as _renderToReadableStream,
   decodeReply,
   loadServerAction,
   createTemporaryReferenceSet,
 } from "@vitejs/plugin-rsc/rsc";
 import { AsyncLocalStorage } from "node:async_hooks";
+
+// React Flight emits HL hints with "stylesheet" for CSS, but the HTML spec
+// requires "style" for <link rel="preload">. Fix at the source so every
+// consumer (SSR embed, client-side navigation, server actions) gets clean data.
+//
+// Flight lines are newline-delimited, so we buffer partial lines across chunks
+// to guarantee the regex never sees a split hint.
+function renderToReadableStream(model, options) {
+  const _hlFixRe = /(\\d+:HL\\[.*?),"stylesheet"(\\]|,)/g;
+  const stream = _renderToReadableStream(model, options);
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let carry = "";
+  return stream.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      const text = carry + decoder.decode(chunk, { stream: true });
+      const lastNl = text.lastIndexOf("\\n");
+      if (lastNl === -1) {
+        carry = text;
+        return;
+      }
+      carry = text.slice(lastNl + 1);
+      controller.enqueue(encoder.encode(text.slice(0, lastNl + 1).replace(_hlFixRe, '$1,"style"$2')));
+    },
+    flush(controller) {
+      const text = carry + decoder.decode();
+      if (text) controller.enqueue(encoder.encode(text.replace(_hlFixRe, '$1,"style"$2')));
+    }
+  }));
+}
 import { createElement, Suspense, Fragment } from "react";
 import { setNavigationContext as _setNavigationContextOrig, getNavigationContext as _getNavigationContext } from "next/navigation";
 import { setHeadersContext, headersContextFromRequest, getDraftModeCookieHeader, getAndClearPendingCookies, consumeDynamicUsage, markDynamicUsage, applyMiddlewareRequestHeaders, getHeadersContext, setHeadersAccessPhase } from "next/headers";
@@ -326,6 +366,7 @@ import { getSSRFontLinks as _getSSRFontLinks, getSSRFontStyles as _getSSRFontSty
 import { getSSRFontStyles as _getSSRFontStylesLocal, getSSRFontPreloads as _getSSRFontPreloadsLocal } from "next/font/local";
 function _getSSRFontStyles() { return [..._getSSRFontStylesGoogle(), ..._getSSRFontStylesLocal()]; }
 function _getSSRFontPreloads() { return [..._getSSRFontPreloadsGoogle(), ..._getSSRFontPreloadsLocal()]; }
+${hasPagesDir ? `// Note: pageRoutes loaded lazily via SSR env in /__vinext/prerender/pages-static-paths handler` : ""}
 ${routeHandlerHelperCode}
 
 // ALS used to suppress the expected "Invalid hook call" dev warning when
@@ -372,6 +413,18 @@ async function __isrSet(key, data, revalidateSeconds, tags) {
 }
 function __pageCacheTags(pathname, extraTags) {
   const tags = [pathname, "_N_T_" + pathname];
+  // Layout hierarchy tags — matches Next.js getDerivedTags.
+  tags.push("_N_T_/layout");
+  const segments = pathname.split("/");
+  let built = "";
+  for (let i = 1; i < segments.length; i++) {
+    if (segments[i]) {
+      built += "/" + segments[i];
+      tags.push("_N_T_" + built + "/layout");
+    }
+  }
+  // Leaf page tag — revalidatePath(path, "page") targets this.
+  tags.push("_N_T_" + built + "/page");
   if (Array.isArray(extraTags)) {
     for (const tag of extraTags) {
       if (!tags.includes(tag)) tags.push(tag);
@@ -436,6 +489,7 @@ function __isrCacheKey(pathname, suffix) {
 }
 function __isrHtmlKey(pathname) { return __isrCacheKey(pathname, "html"); }
 function __isrRscKey(pathname) { return __isrCacheKey(pathname, "rsc"); }
+function __isrRouteKey(pathname) { return __isrCacheKey(pathname, "route"); }
 // Verbose cache logging — opt in with NEXT_PRIVATE_DEBUG_CACHE=1.
 // Matches the env var Next.js uses for its own cache debug output so operators
 // have a single knob for all cache tracing.
@@ -631,6 +685,7 @@ ${
 let __instrumentationInitialized = false;
 let __instrumentationInitPromise = null;
 async function __ensureInstrumentation() {
+  if (process.env.VINEXT_PRERENDER === "1") return;
   if (__instrumentationInitialized) return;
   if (__instrumentationInitPromise) return __instrumentationInitPromise;
   __instrumentationInitPromise = (async () => {
@@ -1443,6 +1498,24 @@ async function __readFormDataWithLimit(request, maxBytes) {
   return new Response(combined, { headers: { "Content-Type": contentType } }).formData();
 }
 
+// Map from route pattern to generateStaticParams function.
+// Used by the prerender phase to enumerate dynamic route URLs without
+// loading route modules via the dev server.
+export const generateStaticParamsMap = {
+// TODO: layout-level generateStaticParams — this map only includes routes that
+// have a pagePath (leaf pages). Layout segments can also export generateStaticParams
+// to provide parent params for nested dynamic routes, but they don't have a pagePath
+// so they are excluded here. Supporting layout-level generateStaticParams requires
+// scanning layout.tsx files separately and including them in this map.
+${routes
+  .filter((r) => r.isDynamic && r.pagePath)
+  .map(
+    (r) =>
+      `  ${JSON.stringify(r.pattern)}: ${getImportVar(r.pagePath!)}?.generateStaticParams ?? null,`,
+  )
+  .join("\n")}
+};
+
 export default async function handler(request, ctx) {
   ${
     instrumentationPath
@@ -1537,6 +1610,79 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       : ""
   }
 
+  // ── Prerender: static-params endpoint ────────────────────────────────
+  // Internal endpoint used by prerenderApp() during build to fetch
+  // generateStaticParams results via wrangler unstable_startWorker.
+  // Gated on VINEXT_PRERENDER=1 to prevent exposure in normal deployments.
+  // For Node builds, process.env.VINEXT_PRERENDER is set directly by the
+  // prerender orchestrator. For CF Workers builds, wrangler unstable_startWorker
+  // injects VINEXT_PRERENDER as a binding which Miniflare exposes via process.env
+  // in bundled workers. The /__vinext/ prefix ensures no user route ever conflicts.
+  if (pathname === "/__vinext/prerender/static-params") {
+    if (process.env.VINEXT_PRERENDER !== "1") {
+      return new Response("Not Found", { status: 404 });
+    }
+    const pattern = url.searchParams.get("pattern");
+    if (!pattern) return new Response("missing pattern", { status: 400 });
+    const fn = generateStaticParamsMap[pattern];
+    if (typeof fn !== "function") return new Response("null", { status: 200, headers: { "content-type": "application/json" } });
+    try {
+      const parentParams = url.searchParams.get("parentParams");
+      const raw = parentParams ? JSON.parse(parentParams) : {};
+      // Ensure params is a plain object — reject primitives, arrays, and null
+      // so user-authored generateStaticParams always receives { params: {} }
+      // rather than { params: 5 } or similar if input is malformed.
+      const params = (typeof raw === "object" && raw !== null && !Array.isArray(raw)) ? raw : {};
+      const result = await fn({ params });
+      return new Response(JSON.stringify(result), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+  }
+
+  ${
+    hasPagesDir
+      ? `
+  // ── Prerender: pages-static-paths endpoint ───────────────────────────
+  // Internal endpoint used by prerenderPages() during a CF Workers hybrid
+  // build to call getStaticPaths() for dynamic Pages Router routes via
+  // wrangler unstable_startWorker. Returns JSON-serialised getStaticPaths result.
+  // Gated on VINEXT_PRERENDER=1 to prevent exposure in normal deployments.
+  // See static-params endpoint above for process.env vs CF vars notes.
+  //
+  // pageRoutes lives in the SSR environment (virtual:vinext-server-entry).
+  // We load it lazily via import.meta.viteRsc.loadModule — the same pattern
+  // used by handleSsr() elsewhere in this template. At build time, Vite's RSC
+  // plugin transforms this call into a bundled cross-environment import, so it
+  // works correctly in the CF Workers production bundle running in Miniflare.
+  if (pathname === "/__vinext/prerender/pages-static-paths") {
+    if (process.env.VINEXT_PRERENDER !== "1") {
+      return new Response("Not Found", { status: 404 });
+    }
+    const __gspPattern = url.searchParams.get("pattern");
+    if (!__gspPattern) return new Response("missing pattern", { status: 400 });
+    try {
+      const __gspSsrEntry = await import.meta.viteRsc.loadModule("ssr", "index");
+      const __pagesRoutes = __gspSsrEntry.pageRoutes;
+      const __gspRoute = Array.isArray(__pagesRoutes)
+        ? __pagesRoutes.find((r) => r.pattern === __gspPattern)
+        : undefined;
+      if (!__gspRoute || typeof __gspRoute.module?.getStaticPaths !== "function") {
+        return new Response("null", { status: 200, headers: { "content-type": "application/json" } });
+      }
+      const __localesParam = url.searchParams.get("locales");
+      const __locales = __localesParam ? JSON.parse(__localesParam) : [];
+      const __defaultLocale = url.searchParams.get("defaultLocale") ?? "";
+      const __gspResult = await __gspRoute.module.getStaticPaths({ locales: __locales, defaultLocale: __defaultLocale });
+      return new Response(JSON.stringify(__gspResult), { status: 200, headers: { "content-type": "application/json" } });
+    } catch (e) {
+      return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { "content-type": "application/json" } });
+    }
+  }
+  `
+      : ""
+  }
+
   // Trailing slash normalization (redirect to canonical form)
   const __tsRedirect = normalizeTrailingSlash(pathname, __basePath, __trailingSlash, url.search);
   if (__tsRedirect) return __tsRedirect;
@@ -1573,6 +1719,47 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   ${
     middlewarePath
       ? `
+  // In hybrid app+pages dev mode the connect handler already ran middleware
+  // and forwarded the results via x-vinext-mw-ctx. Reconstruct _mwCtx from
+  // the forwarded data instead of re-running the middleware function.
+  // Guarded by NODE_ENV because this header only exists in dev (the connect
+  // handler sets it). In production there is no connect handler, so an
+  // attacker-supplied header must not be trusted.
+  let __mwCtxApplied = false;
+  if (process.env.NODE_ENV !== "production") {
+    const __mwCtxHeader = request.headers.get("x-vinext-mw-ctx");
+    if (__mwCtxHeader) {
+      try {
+        const __mwCtxData = JSON.parse(__mwCtxHeader);
+        if (__mwCtxData.h && __mwCtxData.h.length > 0) {
+          // Note: h may include x-middleware-request-* internal headers so
+          // applyMiddlewareRequestHeaders() can unpack them below.
+          // processMiddlewareHeaders() strips them before any response.
+          _mwCtx.headers = new Headers();
+          for (const [key, value] of __mwCtxData.h) {
+            _mwCtx.headers.append(key, value);
+          }
+        }
+        if (__mwCtxData.s != null) {
+          _mwCtx.status = __mwCtxData.s;
+        }
+        // Apply forwarded middleware rewrite so routing uses the rewritten path.
+        // The RSC plugin constructs its Request from the original HTTP request,
+        // not from req.url, so the connect handler's req.url rewrite is invisible.
+        if (__mwCtxData.r) {
+          const __rewriteParsed = new URL(__mwCtxData.r, request.url);
+          cleanPathname = __rewriteParsed.pathname;
+          url.search = __rewriteParsed.search;
+        }
+        // Flag set after full context application — if any step fails (e.g. malformed
+        // rewrite URL), we fall back to re-running middleware as a safety net.
+        __mwCtxApplied = true;
+      } catch (e) {
+        console.error("[vinext] Failed to parse forwarded middleware context:", e);
+      }
+    }
+  }
+  if (!__mwCtxApplied) {
    // Run proxy/middleware if present and path matches.
    // Validate exports match the file type (proxy.ts vs middleware.ts), matching Next.js behavior.
    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/proxy-missing-export/proxy-missing-export.test.ts
@@ -1594,7 +1781,8 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       const mwUrl = new URL(request.url);
       mwUrl.pathname = cleanPathname;
       const mwRequest = new Request(mwUrl, request);
-      const nextRequest = mwRequest instanceof NextRequest ? mwRequest : new NextRequest(mwRequest);
+      const __mwNextConfig = (__basePath || __i18nConfig) ? { basePath: __basePath, i18n: __i18nConfig ?? undefined } : undefined;
+      const nextRequest = mwRequest instanceof NextRequest ? mwRequest : new NextRequest(mwRequest, __mwNextConfig ? { nextConfig: __mwNextConfig } : undefined);
       const mwFetchEvent = new NextFetchEvent({ page: cleanPathname });
       const mwResponse = await middlewareFn(nextRequest, mwFetchEvent);
       const _mwWaitUntil = mwFetchEvent.drainWaitUntil();
@@ -1650,6 +1838,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       return new Response("Internal Server Error", { status: 500 });
     }
   }
+  } // end of if (!__mwCtxApplied)
 
   // Unpack x-middleware-request-* headers into the request context so that
   // headers() returns the middleware-modified headers instead of the original
@@ -1982,6 +2171,32 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   }
 
   if (!match) {
+    ${
+      hasPagesDir
+        ? `
+    // ── Pages Router fallback ────────────────────────────────────────────
+    // When a request doesn't match any App Router route, delegate to the
+    // Pages Router handler (available in the SSR environment). This covers
+    // both production request serving and prerender fetches from wrangler.
+    // RSC requests (.rsc suffix or Accept: text/x-component) cannot be
+    // handled by the Pages Router, so skip the delegation for those.
+    if (!isRscRequest) {
+      const __pagesEntry = await import.meta.viteRsc.loadModule("ssr", "index");
+      if (typeof __pagesEntry.renderPage === "function") {
+        const __pagesRes = await __pagesEntry.renderPage(request, decodeURIComponent(url.pathname) + (url.search || ""), {});
+        // Only return the Pages Router response if it matched a route
+        // (non-404). A 404 means the path isn't a Pages route either,
+        // so fall through to the App Router not-found page below.
+        if (__pagesRes.status !== 404) {
+          setHeadersContext(null);
+          setNavigationContext(null);
+          return __pagesRes;
+        }
+      }
+    }
+    `
+        : ""
+    }
     // Render custom not-found page if available, otherwise plain 404
     const notFoundResponse = await renderNotFoundPage(null, isRscRequest, request);
     if (notFoundResponse) return notFoundResponse;
@@ -2003,7 +2218,7 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
   if (route.routeHandler) {
     const handler = route.routeHandler;
     const method = request.method.toUpperCase();
-    const revalidateSeconds = typeof handler.revalidate === "number" && handler.revalidate > 0 ? handler.revalidate : null;
+    const revalidateSeconds = typeof handler.revalidate === "number" && handler.revalidate > 0 && handler.revalidate !== Infinity ? handler.revalidate : null;
     if (typeof handler["default"] === "function" && process.env.NODE_ENV === "development") {
       console.error(
         "[vinext] Detected default export in route handler " + route.pattern + ". Export a named export for each HTTP method instead.",
@@ -2055,11 +2270,91 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
       isAutoHead = true;
     }
 
+    // ISR cache read for route handlers (production only).
+    // Only GET/HEAD (auto-HEAD) with finite revalidate > 0 are ISR-eligible.
+    // This runs before handler execution so a cache HIT skips the handler entirely.
+    if (
+      process.env.NODE_ENV === "production" &&
+      revalidateSeconds !== null &&
+      handler.dynamic !== "force-dynamic" &&
+      (method === "GET" || isAutoHead) &&
+      typeof handlerFn === "function"
+    ) {
+      const __routeKey = __isrRouteKey(cleanPathname);
+      try {
+        const __cached = await __isrGet(__routeKey);
+        if (__cached && !__cached.isStale && __cached.value.value && __cached.value.value.kind === "APP_ROUTE") {
+          // HIT — return cached response immediately
+          const __cv = __cached.value.value;
+          __isrDebug?.("HIT (route)", cleanPathname);
+          setHeadersContext(null);
+          setNavigationContext(null);
+          const __hitHeaders = Object.assign({}, __cv.headers || {});
+          __hitHeaders["X-Vinext-Cache"] = "HIT";
+          __hitHeaders["Cache-Control"] = "s-maxage=" + revalidateSeconds + ", stale-while-revalidate";
+          if (isAutoHead) {
+            return attachRouteHandlerMiddlewareContext(new Response(null, { status: __cv.status, headers: __hitHeaders }));
+          }
+          return attachRouteHandlerMiddlewareContext(new Response(__cv.body, { status: __cv.status, headers: __hitHeaders }));
+        }
+        if (__cached && __cached.isStale && __cached.value.value && __cached.value.value.kind === "APP_ROUTE") {
+          // STALE — serve stale response, trigger background regeneration
+          const __sv = __cached.value.value;
+          const __revalSecs = revalidateSeconds;
+          const __revalHandlerFn = handlerFn;
+          const __revalParams = params;
+          const __revalUrl = request.url;
+          const __revalSearchParams = new URLSearchParams(url.searchParams);
+          __triggerBackgroundRegeneration(__routeKey, async function() {
+            const __revalHeadCtx = { headers: new Headers(), cookies: new Map() };
+            const __revalUCtx = _createUnifiedCtx({
+              headersContext: __revalHeadCtx,
+              executionContext: _getRequestExecutionContext(),
+            });
+            await _runWithUnifiedCtx(__revalUCtx, async () => {
+              _ensureFetchPatch();
+              setNavigationContext({ pathname: cleanPathname, searchParams: __revalSearchParams, params: __revalParams });
+              const __syntheticReq = new Request(__revalUrl, { method: "GET" });
+              const __revalResponse = await __revalHandlerFn(__syntheticReq, { params: __revalParams });
+              const __regenDynamic = consumeDynamicUsage();
+              setNavigationContext(null);
+              if (__regenDynamic) {
+                __isrDebug?.("route regen skipped (dynamic usage)", cleanPathname);
+                return;
+              }
+              const __freshBody = await __revalResponse.arrayBuffer();
+              const __freshHeaders = {};
+              __revalResponse.headers.forEach(function(v, k) {
+                if (k !== "x-vinext-cache" && k !== "cache-control") __freshHeaders[k] = v;
+              });
+              const __routeTags = __pageCacheTags(cleanPathname, getCollectedFetchTags());
+              await __isrSet(__routeKey, { kind: "APP_ROUTE", body: __freshBody, status: __revalResponse.status, headers: __freshHeaders }, __revalSecs, __routeTags);
+              __isrDebug?.("route regen complete", __routeKey);
+            });
+          });
+          __isrDebug?.("STALE (route)", cleanPathname);
+          setHeadersContext(null);
+          setNavigationContext(null);
+          const __staleHeaders = Object.assign({}, __sv.headers || {});
+          __staleHeaders["X-Vinext-Cache"] = "STALE";
+          __staleHeaders["Cache-Control"] = "s-maxage=0, stale-while-revalidate";
+          if (isAutoHead) {
+            return attachRouteHandlerMiddlewareContext(new Response(null, { status: __sv.status, headers: __staleHeaders }));
+          }
+          return attachRouteHandlerMiddlewareContext(new Response(__sv.body, { status: __sv.status, headers: __staleHeaders }));
+        }
+      } catch (__routeCacheErr) {
+        // Cache read failure — fall through to normal handler execution
+        console.error("[vinext] ISR route cache read error:", __routeCacheErr);
+      }
+    }
+
     if (typeof handlerFn === "function") {
       const previousHeadersPhase = setHeadersAccessPhase("route-handler");
       try {
         const response = await handlerFn(request, { params });
         const dynamicUsedInHandler = consumeDynamicUsage();
+        const handlerSetCacheControl = response.headers.has("cache-control");
 
         // Apply Cache-Control from route segment config (export const revalidate = N).
         // Runtime request APIs like headers() / cookies() make GET handlers dynamic,
@@ -2068,9 +2363,41 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
           revalidateSeconds !== null &&
           !dynamicUsedInHandler &&
           (method === "GET" || isAutoHead) &&
-          !response.headers.has("cache-control")
+          !handlerSetCacheControl
         ) {
           response.headers.set("cache-control", "s-maxage=" + revalidateSeconds + ", stale-while-revalidate");
+        }
+
+        // ISR cache write for route handlers (production, MISS).
+        // Store the raw handler response before cookie/middleware transforms
+        // (those are request-specific and shouldn't be cached).
+        if (
+          process.env.NODE_ENV === "production" &&
+          revalidateSeconds !== null &&
+          handler.dynamic !== "force-dynamic" &&
+          !dynamicUsedInHandler &&
+          (method === "GET" || isAutoHead) &&
+          !handlerSetCacheControl
+        ) {
+          response.headers.set("X-Vinext-Cache", "MISS");
+          const __routeClone = response.clone();
+          const __routeKey = __isrRouteKey(cleanPathname);
+          const __revalSecs = revalidateSeconds;
+          const __routeTags = __pageCacheTags(cleanPathname, getCollectedFetchTags());
+          const __routeWritePromise = (async () => {
+            try {
+              const __buf = await __routeClone.arrayBuffer();
+              const __hdrs = {};
+              __routeClone.headers.forEach(function(v, k) {
+                if (k !== "x-vinext-cache" && k !== "cache-control") __hdrs[k] = v;
+              });
+              await __isrSet(__routeKey, { kind: "APP_ROUTE", body: __buf, status: __routeClone.status, headers: __hdrs }, __revalSecs, __routeTags);
+              __isrDebug?.("route cache written", __routeKey);
+            } catch (__cacheErr) {
+              console.error("[vinext] ISR route cache write error:", __cacheErr);
+            }
+          })();
+          _getRequestExecutionContext()?.waitUntil(__routeWritePromise);
         }
 
         // Collect any Set-Cookie headers from cookies().set()/delete() calls
@@ -2275,8 +2602,8 @@ async function _handleRequest(request, __reqCtx, _mwCtx) {
           });
           const __revalResult = await _runWithUnifiedCtx(__revalUCtx, async () => {
             _ensureFetchPatch();
-            setNavigationContext({ pathname: cleanPathname, searchParams: url.searchParams, params });
-            const __revalElement = await buildPageElement(route, params, undefined, url.searchParams);
+            setNavigationContext({ pathname: cleanPathname, searchParams: new URLSearchParams(), params });
+            const __revalElement = await buildPageElement(route, params, undefined, new URLSearchParams());
             const __revalOnError = createRscOnErrorHandler(request, cleanPathname, route.pattern);
             const __revalRscStream = renderToReadableStream(__revalElement, { onError: __revalOnError });
             // Tee RSC stream: one for SSR, one to capture rscData

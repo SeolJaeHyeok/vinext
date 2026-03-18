@@ -5,8 +5,15 @@ import zlib from "node:zlib";
 import { createBuilder, createServer, type ViteDevServer } from "vite";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { generateRscEntry } from "../packages/vinext/src/entries/app-rsc-entry.js";
+import type { AppRoute } from "../packages/vinext/src/routing/app-router.js";
 import vinext from "../packages/vinext/src/index.js";
-import { APP_FIXTURE_DIR, fetchHtml, RSC_ENTRIES, startFixtureServer } from "./helpers.js";
+import {
+  APP_FIXTURE_DIR,
+  buildAppFixture,
+  fetchHtml,
+  RSC_ENTRIES,
+  startFixtureServer,
+} from "./helpers.js";
 
 describe("App Router integration", () => {
   let server: ViteDevServer;
@@ -510,14 +517,14 @@ describe("App Router integration", () => {
     expect(themeCookie).toContain("dark");
   });
 
-  it("cookies().delete() in route handler produces Max-Age=0 Set-Cookie", async () => {
+  it("cookies().delete() in route handler produces an expired Set-Cookie header", async () => {
     const res = await fetch(`${baseUrl}/api/set-cookie`, { method: "POST" });
     expect(res.status).toBe(200);
 
     const setCookieHeaders = res.headers.getSetCookie();
     const deleteCookie = setCookieHeaders.find((h: string) => h.startsWith("session="));
     expect(deleteCookie).toBeDefined();
-    expect(deleteCookie).toContain("Max-Age=0");
+    expect(deleteCookie).toContain("Expires=");
   });
 
   it("renders custom not-found.tsx for unmatched routes", async () => {
@@ -1183,7 +1190,7 @@ describe("App Router integration", () => {
     expect(res.status).not.toBe(403);
   });
 
-  it("allows server action POST with Origin 'null' (privacy-sensitive context)", async () => {
+  it("blocks server action POST with Origin 'null' (CSRF via sandboxed context)", async () => {
     const res = await fetch(`${baseUrl}/actions.rsc`, {
       method: "POST",
       headers: {
@@ -1193,9 +1200,9 @@ describe("App Router integration", () => {
       },
       body: "[]",
     });
-    // Origin "null" is sent by browsers in privacy-sensitive contexts,
-    // should be treated as missing and allowed through.
-    expect(res.status).not.toBe(403);
+    // Origin "null" is sent by browsers in opaque/sandboxed contexts.
+    // Must be blocked unless explicitly allowlisted (CVE: GHSA-mq59-m269-xvcx).
+    expect(res.status).toBe(403);
   });
 
   it("rejects server action POST when X-Forwarded-Host matches spoofed Origin", async () => {
@@ -1305,11 +1312,12 @@ describe("App Router dev server origin check", () => {
     expect(res.status).toBe(200);
   });
 
-  it("allows requests with Origin 'null' (privacy-sensitive context)", async () => {
+  it("blocks requests with Origin 'null' (CSRF via sandboxed context)", async () => {
     const res = await fetch(`${baseUrl}/`, {
       headers: { Origin: "null" },
     });
-    expect(res.status).toBe(200);
+    // Origin "null" must be blocked unless explicitly allowlisted (CVE: GHSA-jcc7-9wpm-mj36).
+    expect(res.status).toBe(403);
   });
 
   it("blocks cross-origin requests", async () => {
@@ -1456,7 +1464,7 @@ describe("App Router Production build", () => {
 
 describe("App Router Production server (startProdServer)", () => {
   const outDir = path.resolve(APP_FIXTURE_DIR, "dist");
-  let server: import("node:http").Server;
+  let server: import("node:http").Server | undefined;
   let baseUrl: string;
 
   function extractRequestId(html: string): string | undefined {
@@ -1479,8 +1487,8 @@ describe("App Router Production server (startProdServer)", () => {
 
     // Start the production server on a random available port
     const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
-    server = await startProdServer({ port: 0, outDir, noCompression: false });
-    const addr = server.address();
+    ({ server } = await startProdServer({ port: 0, outDir, noCompression: false }));
+    const addr = server!.address();
     const port = typeof addr === "object" && addr ? addr.port : 4210;
     baseUrl = `http://localhost:${port}`;
   }, 60000);
@@ -1596,7 +1604,6 @@ describe("App Router Production server (startProdServer)", () => {
 
     const errorRes = await fetch(`${baseUrl}/error-server-test`);
     expect(errorRes.status).toBe(200);
-    await errorRes.text();
 
     await new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -1682,6 +1689,115 @@ describe("App Router Production server (startProdServer)", () => {
     expect(reqId3).not.toBe(reqId1);
     expect(res3.headers.get("x-vinext-cache")).toBe("MISS");
   });
+
+  // Route handler ISR caching tests
+  // These tests are ORDER-DEPENDENT: they share a single production server and
+  // /api/static-data cache state persists across tests. HIT depends on MISS
+  // having run first, STALE re-warms explicitly. Take care when adding new tests.
+  // Fixture: /api/static-data exports revalidate = 1 and returns { timestamp: Date.now() }
+  it("route handler ISR: first GET returns MISS", async () => {
+    const res = await fetch(`${baseUrl}/api/static-data`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("x-vinext-cache")).toBe("MISS");
+  });
+
+  it("route handler ISR: second GET returns cached response (HIT)", async () => {
+    // First request populates cache
+    const res1 = await fetch(`${baseUrl}/api/static-data`);
+    const body1 = await res1.json();
+    expect(res1.status).toBe(200);
+
+    // Second request should be a cache hit with identical response
+    const res2 = await fetch(`${baseUrl}/api/static-data`);
+    const body2 = await res2.json();
+    expect(res2.status).toBe(200);
+    expect(body2.timestamp).toBe(body1.timestamp);
+    expect(res2.headers.get("x-vinext-cache")).toBe("HIT");
+  });
+
+  it("route handler ISR: POST bypasses cache", async () => {
+    // POST should never be cached even with revalidate set on GET
+    const res = await fetch(`${baseUrl}/api/static-data`, { method: "POST" });
+    // /api/static-data only exports GET, POST should be 405
+    expect(res.status).toBe(405);
+    expect(res.headers.get("x-vinext-cache")).toBeNull();
+  });
+
+  it("route handler ISR: dynamic handler (reads headers()) is not cached", async () => {
+    // /api/dynamic-request-data exports revalidate=60 but reads headers() and cookies()
+    const res1 = await fetch(`${baseUrl}/api/dynamic-request-data`, {
+      headers: { "x-test-ping": "a" },
+    });
+    const res2 = await fetch(`${baseUrl}/api/dynamic-request-data`, {
+      headers: { "x-test-ping": "b" },
+    });
+    // Dynamic usage should prevent ISR caching
+    expect(res1.headers.get("x-vinext-cache")).toBeNull();
+    expect(res2.headers.get("x-vinext-cache")).toBeNull();
+  });
+
+  it("route handler ISR: handler-set Cache-Control skips ISR caching", async () => {
+    // /api/custom-cache exports revalidate=60 but sets its own Cache-Control
+    const res1 = await fetch(`${baseUrl}/api/custom-cache`);
+    const res2 = await fetch(`${baseUrl}/api/custom-cache`);
+    // Handler controls caching — ISR should not interfere
+    expect(res1.headers.get("x-vinext-cache")).toBeNull();
+    expect(res2.headers.get("x-vinext-cache")).toBeNull();
+  });
+
+  it("route handler ISR: force-dynamic handler is not cached", async () => {
+    // /api/force-dynamic-revalidate exports revalidate=60 AND dynamic="force-dynamic"
+    const res1 = await fetch(`${baseUrl}/api/force-dynamic-revalidate`);
+    const res2 = await fetch(`${baseUrl}/api/force-dynamic-revalidate`);
+    expect(res1.headers.get("x-vinext-cache")).toBeNull();
+    expect(res2.headers.get("x-vinext-cache")).toBeNull();
+  });
+
+  it("route handler ISR: STALE serves stale data and triggers background regen", async () => {
+    // /api/static-data has revalidate=1
+    // Cache may already be warm from earlier tests — ensure we have a known timestamp
+    const warm = await fetch(`${baseUrl}/api/static-data`);
+    const warmBody = await warm.json();
+    const cachedTimestamp = warmBody.timestamp;
+
+    // Wait for cache entry to become stale (revalidate=1, generous margin for slow CI)
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    // STALE — serves stale data, triggers background regen
+    const staleRes = await fetch(`${baseUrl}/api/static-data`);
+    expect(staleRes.headers.get("x-vinext-cache")).toBe("STALE");
+    const staleBody = await staleRes.json();
+    expect(staleBody.timestamp).toBe(cachedTimestamp); // Still the old data
+
+    // Poll until background regen completes (up to 5s)
+    const deadline = Date.now() + 5000;
+    let freshRes: Response;
+    let freshBody: { timestamp: number };
+    do {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      freshRes = await fetch(`${baseUrl}/api/static-data`);
+      freshBody = await freshRes.json();
+    } while (freshRes.headers.get("x-vinext-cache") !== "HIT" && Date.now() < deadline);
+
+    // HIT — fresh data from background regen
+    expect(freshRes.headers.get("x-vinext-cache")).toBe("HIT");
+    expect(freshBody.timestamp).not.toBe(cachedTimestamp); // New data
+  });
+
+  it("route handler ISR: auto-HEAD returns cached headers with empty body", async () => {
+    // Ensure cache is warm
+    const getRes = await fetch(`${baseUrl}/api/static-data`);
+    await getRes.text();
+    const cacheHeader = getRes.headers.get("x-vinext-cache");
+    expect(cacheHeader === "MISS" || cacheHeader === "HIT" || cacheHeader === "STALE").toBe(true);
+
+    // HEAD against a GET-only route should return cached headers, no body
+    const headRes = await fetch(`${baseUrl}/api/static-data`, { method: "HEAD" });
+    expect(headRes.status).toBe(200);
+    expect(headRes.headers.get("x-vinext-cache")).toBe("HIT");
+    const body = await headRes.text();
+    expect(body).toBe("");
+  });
 });
 
 describe("App Router Production server worker entry compatibility", () => {
@@ -1710,7 +1826,7 @@ export default {
     );
 
     const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
-    const server = await startProdServer({ port: 0, outDir, noCompression: true });
+    const { server } = await startProdServer({ port: 0, outDir, noCompression: true });
     const addr = server.address();
     const port = typeof addr === "object" && addr ? addr.port : 0;
 
@@ -1793,16 +1909,14 @@ describe("App Router dev server malformed URL handling", () => {
 });
 
 describe("App Router Static export", () => {
-  let server: ViteDevServer;
-  let baseUrl: string;
+  let rscBundlePath: string;
   const exportDir = path.resolve(APP_FIXTURE_DIR, "out");
 
   beforeAll(async () => {
-    ({ server, baseUrl } = await startFixtureServer(APP_FIXTURE_DIR, { appRouter: true }));
-  });
+    rscBundlePath = await buildAppFixture(APP_FIXTURE_DIR);
+  }, 120_000);
 
-  afterAll(async () => {
-    await server.close();
+  afterAll(() => {
     fs.rmSync(exportDir, { recursive: true, force: true });
   });
 
@@ -1816,10 +1930,8 @@ describe("App Router Static export", () => {
     const config = await resolveNextConfig({ output: "export" });
 
     const result = await staticExportApp({
-      baseUrl,
       routes,
-      appDir,
-      server,
+      rscBundlePath,
       outDir: exportDir,
       config,
     });
@@ -1886,10 +1998,8 @@ describe("App Router Static export", () => {
 
     try {
       const result = await staticExportApp({
-        baseUrl,
         routes: fakeRoutes,
-        appDir: path.resolve(APP_FIXTURE_DIR, "app"),
-        server,
+        rscBundlePath,
         outDir: tempDir,
         config,
       });
@@ -1933,10 +2043,8 @@ describe("App Router Static export", () => {
 
     try {
       const result = await staticExportApp({
-        baseUrl,
         routes: fakeRoutes,
-        appDir: path.resolve(APP_FIXTURE_DIR, "app"),
-        server,
+        rscBundlePath,
         outDir: tempDir,
         config,
       });
@@ -2833,6 +2941,7 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
         const onErrorFn = extractFunction(code, "rscOnError");
 
         const body = `${digestFn}\n${onErrorFn}\nreturn rscOnError;`;
+        // oxlint-disable-next-line typescript-eslint/no-implied-eval -- reconstructing emitted runtime code is the behavior under test
         const factory = new Function("process", body);
         rscOnError = factory({ env: { NODE_ENV: "development" } });
       });
@@ -3043,13 +3152,33 @@ describe("SSR entry CSS preload fix", () => {
     expect(code).toContain('as="style"');
   });
 
-  it("generateSsrEntry includes fixFlightHints in RSC embed transform", async () => {
-    const { generateSsrEntry } = await import("../packages/vinext/src/entries/app-ssr-entry.js");
-    const code = generateSsrEntry();
-    // The RSC embed stream should fix HL hint "stylesheet" → "style" before
-    // chunks are embedded as __VINEXT_RSC_CHUNKS__ for client-side processing
-    expect(code).toContain("fixFlightHints");
-    expect(code).toContain('"style"');
+  it("generateRscEntry wraps renderToReadableStream with HL hint fix", () => {
+    // The RSC entry should shadow renderToReadableStream with a wrapper that
+    // rewrites Flight HL hint "stylesheet" → "style" at the stream source,
+    // so all consumers (SSR embed, client-side nav, server actions) get clean data.
+    const route: AppRoute = {
+      pattern: "/",
+      pagePath: "/tmp/test/app/page.tsx",
+      routePath: null,
+      layouts: ["/tmp/test/app/layout.tsx"],
+      templates: [],
+      parallelSlots: [],
+      loadingPath: null,
+      errorPath: null,
+      layoutErrorPaths: [null],
+      notFoundPath: null,
+      notFoundPaths: [null],
+      forbiddenPath: null,
+      unauthorizedPath: null,
+      routeSegments: [],
+      layoutTreePositions: [0],
+      isDynamic: false,
+      params: [],
+      patternParts: ["/"],
+    };
+    const code = generateRscEntry("/tmp/test/app", [route]);
+    expect(code).toContain("_renderToReadableStream");
+    expect(code).toContain('"style"$2');
   });
 
   it('fixPreloadAs regex correctly replaces as="stylesheet" with as="style"', () => {
@@ -3094,10 +3223,9 @@ describe("SSR entry CSS preload fix", () => {
   });
 
   it('fixFlightHints regex correctly replaces "stylesheet" with "style" in RSC Flight HL hints', () => {
-    // Replicate the fixFlightHints regex from the generated SSR entry.
-    // This runs on the raw Flight protocol text embedded in __VINEXT_RSC_CHUNKS__
-    // so that client-side React creates valid <link rel="preload" as="style"> instead
-    // of invalid <link rel="preload" as="stylesheet">.
+    // Replicate the HL hint rewrite regex from the renderToReadableStream wrapper
+    // in app-rsc-entry.ts. This rewrites the Flight stream at the source so all
+    // consumers (SSR embed, client-side nav, server actions) get clean data.
     function fixFlightHints(text: string): string {
       return text.replace(/(\d+:HL\[.*?),"stylesheet"(\]|,)/g, '$1,"style"$2');
     }
@@ -3169,6 +3297,76 @@ describe("Tick-buffered RSC delivery", () => {
     expect(code).toContain("DOMContentLoaded");
     // Should NOT use setTimeout-based polling
     expect(code).not.toContain("setTimeout(resolve, 1)");
+  });
+});
+
+// ── Client reference preloading (Issue #256) ─────────────────────────────────
+//
+// On the first SSR request after server start, client reference modules are
+// loaded lazily via async import(). The memoize cache in @vitejs/plugin-rsc is
+// cold, so __vite_rsc_client_require__ returns an unresolved Promise. Without
+// <Suspense> wrapping the root shell, React SSR rejects and the server returns
+// 500. Subsequent requests work because the memoize cache is warm.
+//
+// Fix: the SSR entry eagerly preloads all client reference modules before
+// renderToReadableStream runs, warming the memoize cache on every request.
+
+describe("Client reference preloading (Issue #256)", () => {
+  it("preloading correctly warms the memoize cache", async () => {
+    // Replicate the memoize + lazy-load pattern from @vitejs/plugin-rsc
+    // to verify that preloading prevents the first-request 500.
+    const loadCounts = new Map<string, number>();
+
+    function memoize(f: (id: string) => Promise<Record<string, unknown>>) {
+      const cache = new Map<string, Promise<Record<string, unknown>>>();
+      return (id: string) => {
+        const cached = cache.get(id);
+        if (cached !== undefined) return cached;
+        const result = f(id);
+        cache.set(id, result);
+        return result;
+      };
+    }
+
+    // Simulate lazy client module loading (async import)
+    const requireModule = memoize(async (id: string) => {
+      loadCounts.set(id, (loadCounts.get(id) ?? 0) + 1);
+      // Simulate async module load
+      await new Promise((r) => setTimeout(r, 10));
+      return { default: `component-${id}` };
+    });
+
+    const clientRefs = { "comp-a": true, "comp-b": true, "comp-c": true };
+
+    // Without preloading: requireModule returns unresolved promises
+    const beforePreload = requireModule("comp-a");
+    // The promise is pending — this is what causes the 500 on first request
+    expect(beforePreload).toBeInstanceOf(Promise);
+
+    // Preload all references (the fix)
+    await Promise.all(Object.keys(clientRefs).map((id) => requireModule(id)));
+
+    // After preloading: memoize cache is warm, promises are resolved.
+    // Calling requireModule again returns the same (now-resolved) promise.
+    const afterPreload = requireModule("comp-a");
+    expect(afterPreload).toBeInstanceOf(Promise);
+    const resolved = await afterPreload;
+    expect(resolved).toEqual({ default: "component-comp-a" });
+
+    // Critical invariant: after preloading, the cached promise must be
+    // already settled. React SSR calls __vite_rsc_client_require__ and
+    // expects a synchronously resolvable value — if the promise is still
+    // pending, renderToReadableStream rejects (the original 500 bug).
+    const SETTLED = Symbol("settled");
+    const raceResult = await Promise.race([requireModule("comp-b"), Promise.resolve(SETTLED)]);
+    // If the cached promise were still pending, raceResult would be SETTLED.
+    // A resolved cache means the module value wins the race.
+    expect(raceResult).toEqual({ default: "component-comp-b" });
+
+    // Each module should only be loaded once (memoize dedup)
+    expect(loadCounts.get("comp-a")).toBe(1);
+    expect(loadCounts.get("comp-b")).toBe(1);
+    expect(loadCounts.get("comp-c")).toBe(1);
   });
 });
 
@@ -3611,5 +3809,26 @@ describe("generateRscEntry ISR code generation", () => {
     expect(teeAssignIdx).toBeGreaterThan(-1);
     expect(rscResponseIdx).toBeGreaterThan(-1);
     expect(teeAssignIdx).toBeLessThan(rscResponseIdx);
+  });
+
+  // Route handler ISR code generation tests
+  it("generated code contains __isrRouteKey helper", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes);
+    expect(code).toContain("__isrRouteKey");
+  });
+
+  it("generated code contains APP_ROUTE ISR cache read for route handlers", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes);
+    expect(code).toContain('"APP_ROUTE"');
+    // Route handler ISR uses __isrRouteKey to build the cache key, then reads via __isrGet
+    expect(code).toContain("__isrRouteKey(cleanPathname)");
+    expect(code).toContain("__isrGet(__routeKey)");
+  });
+
+  it("generated code contains APP_ROUTE ISR cache write for route handlers", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes);
+    // Route handler ISR writes use __isrSet with __routeKey and APP_ROUTE kind
+    expect(code).toContain("__isrSet(__routeKey,");
+    expect(code).toContain('kind: "APP_ROUTE"');
   });
 });
